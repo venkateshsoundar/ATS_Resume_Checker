@@ -108,17 +108,6 @@ def calculate_ats_score(resume_text: str, job_description: str):
 
     return adjusted_score, score_semantic, score_keywords, matching, missing, improvement_tips, fit_status, llm_feedback, bullet_suggestions
 
-# Visualization
-def plot_scores(ats, semantic, keyword):
-    fig, ax = plt.subplots()
-    metrics = ["Final ATS", "Semantic", "Keyword"]
-    scores = [ats, semantic, keyword]
-    sns.barplot(x=metrics, y=scores, palette="viridis", ax=ax)
-    ax.set_ylim(0, 100)
-    ax.set_title("📊 ATS Scoring Breakdown")
-    for i, score in enumerate(scores):
-        ax.text(i, score + 1, f"{score}%", ha='center', fontweight='bold')
-    st.pyplot(fig)
 
 # UI
 st.set_page_config(page_title="ATS Resume Scanner", layout="wide")
