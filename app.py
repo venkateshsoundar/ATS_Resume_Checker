@@ -67,7 +67,7 @@ def llm_adjust_score(score, resume_text, jd_text):
     """
     try:
         response = client.chat.completions.create(
-            model="deepseek-chat",
+            model="deepseek/deepseek-r1-0528:free",
             messages=[{"role": "user", "content": prompt}]
         )
         content = response.choices[0].message.content
