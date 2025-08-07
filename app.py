@@ -10,6 +10,10 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 from openai import OpenAI
 import json
+import spacy
+
+# Load NLP model for skill extraction
+nlp = spacy.load("en_core_web_sm")
 
 # Load SBERT model
 @st.cache_resource(show_spinner="Loading embedding model...")
@@ -29,6 +33,7 @@ def load_llm_client():
 client = load_llm_client()
 
 # Clean text
+
 def clean_text(text):
     text = re.sub(r'[^a-zA-Z0-9\s]', '', text.lower())
     return re.sub(r'\s+', ' ', text).strip()
@@ -45,24 +50,30 @@ def extract_text_from_file(uploaded_file):
     else:
         return uploaded_file.read().decode("utf-8")
 
+# Extract relevant keywords from text using SpaCy
+def extract_keywords(text):
+    doc = nlp(text)
+    return set([token.lemma_.lower() for token in doc if token.pos_ in ['NOUN', 'PROPN', 'VERB', 'ADJ'] and not token.is_stop])
+
 # LLM-enhanced score refinement and bullet suggestions
 def llm_adjust_score(score, resume_text, jd_text):
     prompt = f"""
-    You're an ATS resume assistant. The user has a resume and a job description. The initial score is {score}%.
-    Analyze the alignment based on role expectations, soft skills, and language alignment.
-    Suggest a revised score (0–100), a brief feedback note, and 3 improved bullet points for the resume.
+    You're an advanced ATS evaluator. Analyze the resume and job description below.
+    Return:
+    - Revised score out of 100
+    - Two strengths
+    - Two weaknesses
+    - Three resume bullet improvements
 
-    Resume:
-    {resume_text[:1500]}
+    Resume: {resume_text[:1200]}
+    Job Description: {jd_text[:1200]}
 
-    Job Description:
-    {jd_text[:1500]}
-
-    Respond with JSON:
+    Respond in JSON:
     {{
-      "score": revised_score,
-      "note": "short feedback",
-      "suggestions": ["bullet 1", "bullet 2", "bullet 3"]
+      "score": 78,
+      "strengths": [""],
+      "weaknesses": [""],
+      "suggestions": [""],
     }}
     """
     try:
@@ -72,9 +83,9 @@ def llm_adjust_score(score, resume_text, jd_text):
         )
         content = response.choices[0].message.content
         parsed = json.loads(content)
-        return min(parsed.get("score", score), 100), parsed.get("note", ""), parsed.get("suggestions", [])
-    except Exception as e:
-        return score, "(LLM feedback unavailable)", []
+        return min(parsed.get("score", score), 100), parsed.get("strengths", []), parsed.get("weaknesses", []), parsed.get("suggestions", [])
+    except Exception:
+        return score, [], [], []
 
 # Calculate ATS score
 def calculate_ats_score(resume_text: str, job_description: str):
@@ -89,7 +100,7 @@ def calculate_ats_score(resume_text: str, job_description: str):
 
     job_tokens = tfidf.get_feature_names_out()
     resume_counts = resume_vec.toarray()[0]
-    matching = [token for token, count in zip(job_tokens, resume_counts) if count > 0]
+    matched = [token for token, count in zip(job_tokens, resume_counts) if count > 0]
     missing = [token for token, count in zip(job_tokens, resume_counts) if count == 0]
 
     emb_jd = model.encode(jd_clean, convert_to_tensor=True)
@@ -97,22 +108,23 @@ def calculate_ats_score(resume_text: str, job_description: str):
     semantic_score = util.cos_sim(emb_jd, emb_resume).item()
     score_semantic = round(semantic_score * 100, 2)
 
-    final_score = round((score_keywords * 0.4 + score_semantic * 0.6), 2)
-    adjusted_score, llm_feedback, bullet_suggestions = llm_adjust_score(final_score, resume_text, job_description)
+    # Adaptive weight logic
+    if len(jd_clean.split()) > 200:
+        final_score = round((score_keywords * 0.3 + score_semantic * 0.7), 2)
+    else:
+        final_score = round((score_keywords * 0.5 + score_semantic * 0.5), 2)
 
-    improvement_tips = [
-        f"Consider including the term '{word}' in your resume." for word in missing[:10]
-    ]
+    adjusted_score, strengths, weaknesses, bullet_suggestions = llm_adjust_score(final_score, resume_text, job_description)
 
-    fit_status = "✅ You are a strong match for this role!" if adjusted_score >= 75 else ("⚠️ You might need some improvements." if adjusted_score >= 50 else "❌ Currently not a fit. Revise your resume.")
+    tips = [f"Consider including the term '{word}' in your resume." for word in missing[:10]]
 
-    return adjusted_score, score_semantic, score_keywords, matching, missing, improvement_tips, fit_status, llm_feedback, bullet_suggestions
+    fit_status = "✅ Strong match!" if adjusted_score >= 75 else ("⚠️ Moderate match." if adjusted_score >= 50 else "❌ Low match.")
 
+    return adjusted_score, score_semantic, score_keywords, matched, missing, tips, fit_status, strengths, weaknesses, bullet_suggestions
 
-# UI
+# Streamlit UI
 st.set_page_config(page_title="ATS Resume Scanner", layout="wide")
 st.title("📄 ATS Resume Scanner")
-st.markdown("Upload your resume and paste the job description to get your ATS match score.")
 
 col1, col2 = st.columns(2)
 with col1:
@@ -120,7 +132,7 @@ with col1:
     resume_text = ""
     if uploaded_resume:
         resume_text = extract_text_from_file(uploaded_resume)
-        st.success("Resume text extracted successfully.")
+        st.success("Resume loaded successfully.")
     else:
         resume_text = st.text_area("Or paste your Resume Text", height=250)
 
@@ -129,17 +141,19 @@ with col2:
 
 if resume_text and jd_input:
     with st.spinner("Analyzing your resume against the job description..."):
-        ats_score, semantic_score, keyword_score, matched, missing, tips, fit_status, llm_feedback, suggestions = calculate_ats_score(resume_text, jd_input)
+        ats_score, semantic_score, keyword_score, matched, missing, tips, fit_status, strengths, weaknesses, suggestions = calculate_ats_score(resume_text, jd_input)
 
     st.subheader("✅ ATS Match Results")
     st.metric("Final ATS Score", f"{ats_score}%")
     st.metric("Semantic Similarity", f"{semantic_score}%")
     st.metric("Keyword Match Score", f"{keyword_score}%")
 
-    st.markdown(f"### 💬 Role Fit Evaluation\n**{fit_status}**")
+    st.markdown(f"### 💬 Fit Evaluation: {fit_status}")
 
-    if llm_feedback:
-        st.info(f"🤖 LLM Feedback: {llm_feedback}")
+    if strengths:
+        st.success("**Strengths:** " + ", ".join(strengths))
+    if weaknesses:
+        st.warning("**Weaknesses:** " + ", ".join(weaknesses))
 
     if suggestions:
         with st.expander("✍️ Suggested Resume Bullet Points"):
