@@ -136,8 +136,6 @@ if resume_text and jd_input:
     st.metric("Semantic Similarity", f"{semantic_score}%")
     st.metric("Keyword Match Score", f"{keyword_score}%")
 
-    plot_scores(ats_score, semantic_score, keyword_score)
-
     st.markdown(f"### 💬 Role Fit Evaluation\n**{fit_status}**")
 
     if llm_feedback:
