@@ -18,7 +18,7 @@ except OSError:
     from spacy.cli import download
     download("en_core_web_sm")
     nlp = spacy.load("en_core_web_sm")
-import spacy
+
 
 # Load NLP model for skill extraction
 nlp = spacy.load("en_core_web_sm")
