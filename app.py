@@ -51,12 +51,11 @@ def extract_text_from_file(uploaded_file):
     if uploaded_file.name.endswith(".pdf"):
         pdf_reader = PdfReader(uploaded_file)
         return "\n".join(page.extract_text() for page in pdf_reader.pages if page.extract_text())
-    elif uploaded_file.name.endswith(".docx"):
+    if uploaded_file.name.endswith(".docx"):
         with tempfile.NamedTemporaryFile(delete=False, suffix=".docx") as tmp:
             tmp.write(uploaded_file.read())
             return docx2txt.process(tmp.name)
-    else:
-        return uploaded_file.read().decode("utf-8")
+    raise ValueError("Unsupported file type. Please upload a PDF or DOCX file.")
 
 # Extract relevant keywords from text using SpaCy
 def extract_keywords(text):
@@ -130,19 +129,29 @@ def calculate_ats_score(resume_text: str, job_description: str):
 
     return adjusted_score, score_semantic, score_keywords, matched, missing, tips, fit_status, strengths, weaknesses, bullet_suggestions
 
+
+def optimize_resume(resume_text: str, job_description: str) -> str:
+    prompt = f"""\nYou are a professional resume writer. Using the resume and job description below, rewrite the resume so that it is optimized for the job.\n- Update the professional summary to align with the job description.\n- Highlight relevant tools and skills.\n- Rephrase professional experience bullet points to emphasize alignment with the job requirements.\nProvide the full optimized resume in plain text.\nResume: {resume_text[:2000]}\nJob Description: {job_description[:2000]}\n"""
+    try:
+        response = client.chat.completions.create(
+            model="deepseek/deepseek-r1-0528:free",
+            messages=[{"role": "user", "content": prompt}]
+        )
+        return response.choices[0].message.content.strip()
+    except Exception as e:
+        return f"Error generating optimized resume: {e}"
+
 # Streamlit UI
 st.set_page_config(page_title="ATS Resume Scanner", layout="wide")
 st.title("📄 ATS Resume Scanner")
 
 col1, col2 = st.columns(2)
 with col1:
-    uploaded_resume = st.file_uploader("📁 Upload Resume (PDF, DOCX, TXT)", type=["pdf", "docx", "txt"])
+    uploaded_resume = st.file_uploader("📁 Upload Resume (PDF, DOCX)", type=["pdf", "docx"])
     resume_text = ""
     if uploaded_resume:
         resume_text = extract_text_from_file(uploaded_resume)
         st.success("Resume loaded successfully.")
-    else:
-        resume_text = st.text_area("Or paste your Resume Text", height=250)
 
 with col2:
     jd_input = st.text_area("📌 Paste Job Description", height=300)
@@ -176,5 +185,16 @@ if resume_text and jd_input:
 
     with st.expander("💡 Suggestions to Improve Match"):
         st.write("\n".join(tips) if tips else "Your resume already covers most keywords!")
+
+    if st.button("Generate Optimized Resume"):
+        with st.spinner("Optimizing resume with AI..."):
+            optimized_resume = optimize_resume(resume_text, jd_input)
+        st.subheader("📝 Optimized Resume")
+        st.text_area("Optimized Resume", optimized_resume, height=400)
+        st.download_button(
+            "Download Optimized Resume",
+            optimized_resume,
+            file_name="optimized_resume.txt"
+        )
 else:
     st.info("Please upload a resume and enter a job description to get started.")
