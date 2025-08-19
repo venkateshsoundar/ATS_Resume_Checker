@@ -193,21 +193,41 @@ def cap_bullets_each_role(doc: Document, n_keep=3):
         i += 1
 
 def replace_profile_summary(doc: Document, new_summary: str):
+    """
+    Replaces PROFILE/SUMMARY content with `new_summary`.
+    Uses insert-before-next-heading (no insert_paragraph_after).
+    """
     h = find_first_heading(doc, "PROFILE") or find_first_heading(doc, "SUMMARY")
     if h is None:
-        # Prepend profile if not present
-        p = doc.paragraphs[0] if doc.paragraphs else doc.add_paragraph("")
-        heading = doc.add_paragraph("PROFILE")
-        summary = doc.add_paragraph(new_summary)
+        # No profile: create one at the top safely using insert_paragraph_before (this *is* supported)
+        if doc.paragraphs:
+            first = doc.paragraphs[0]
+            first.insert_paragraph_before(new_summary)
+            first.insert_paragraph_before("PROFILE")
+        else:
+            # extremely rare: empty doc
+            doc.add_paragraph("PROFILE")
+            doc.add_paragraph(new_summary)
         return
+
+    # Find where this section ends
     end = next_section_index(doc, h)
-    # remove everything between heading and next heading
+
+    # Remove everything between heading and next heading
     i = h + 1
     while i < end:
         delete_paragraph(doc.paragraphs[i])
         end -= 1
-    # Insert a fresh paragraph after heading
-    doc.paragraphs[h].insert_paragraph_after(new_summary)
+
+    # After deletion, `end` now points to the next heading (or end of doc).
+    # Insert the new summary **before** that next heading. This effectively puts the
+    # summary right after the PROFILE/SUMMARY heading without using insert_paragraph_after.
+    if end < len(doc.paragraphs):
+        doc.paragraphs[end].insert_paragraph_before(new_summary)
+    else:
+        # if there is no next heading, just append
+        doc.add_paragraph(new_summary)
+
 
 def enforce_two_pages_soft(doc: Document, hard_char_cap=9500):
     txt = read_docx_text(doc)
