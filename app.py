@@ -1,180 +1,157 @@
-import streamlit as st
-from sentence_transformers import SentenceTransformer, util
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.metrics.pairwise import cosine_similarity
-from PyPDF2 import PdfReader
-import docx2txt
-import tempfile
+
+"""
+ATS Optimizer — Streamlit Cloud Ready
+Author: Venky (Venkatesh)
+
+What it does
+- Upload resume (DOCX/PDF)
+- Paste JD + choose target role
+- Optimize with OpenRouter (model picker)
+- Edit optimized draft, view unified diff
+- Download TXT/DOCX
+
+Notes for Cloud
+- Set your OPENROUTER_API_KEY in Streamlit Secrets (App settings → Secrets).
+- PDF export via docx2pdf is disabled on Cloud (requires MS Word). Local-only.
+"""
+
+import io
+import os
+import difflib
 import re
-import matplotlib.pyplot as plt
-import seaborn as sns
-from openai import OpenAI
-import json
+import requests
+import streamlit as st
+from PyPDF2 import PdfReader
 
-import spacy
 try:
-    nlp = spacy.load("en_core_web_sm")
-except OSError:
-    from spacy.cli import download
-    download("en_core_web_sm")
-    nlp = spacy.load("en_core_web_sm")
+    import docx  # python-docx
+except ImportError:
+    docx = None
 
+# ---------------------------
+# Config
+# ---------------------------
+OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+# read API key from st.secrets first, then env fallback
+OPENROUTER_API_KEY = st.secrets.get("OPENROUTER_API_KEY", os.getenv("OPENROUTER_API_KEY", ""))
 
-# Load NLP model for skill extraction
-nlp = spacy.load("en_core_web_sm")
+AVAILABLE_MODELS = [
+    "deepseek/deepseek-r1-0528:free",
+    "openai/gpt-oss-20b:free"
+]
 
-# Load SBERT model
-@st.cache_resource(show_spinner="Loading embedding model...")
-def load_model():
-    return SentenceTransformer('all-MiniLM-L6-v2')
+# ---------------------------
+# Utils
+# ---------------------------
+def read_docx_text(file) -> str:
+    if docx is None:
+        st.error("python-docx not installed. Add it to requirements.txt")
+        return ""
+    d = docx.Document(file)
+    return "\n".join(p.text for p in d.paragraphs)
 
-model = load_model()
+def read_pdf_text(file) -> str:
+    reader = PdfReader(file)
+    text = "\n".join(page.extract_text() or "" for page in reader.pages)
+    return text
 
-# Setup DeepSeek LLM client
-@st.cache_resource(show_spinner="Connecting to DeepSeek AI...")
-def load_llm_client():
-    return OpenAI(
-        base_url="https://openrouter.ai/api/v1",
-        api_key=st.secrets["DEEPSEEK_API_KEY"]
+def write_docx_from_text(text: str) -> bytes:
+    if docx is None:
+        st.error("python-docx not installed. Add it to requirements.txt")
+        return b""
+    d = docx.Document()
+    for line in text.splitlines():
+        d.add_paragraph(line)
+    bio = io.BytesIO()
+    d.save(bio); bio.seek(0)
+    return bio.read()
+
+def make_unified_diff(a: str, b: str) -> str:
+    return "\n".join(difflib.unified_diff(a.splitlines(), b.splitlines(),
+                                          fromfile="original", tofile="optimized", lineterm=""))
+
+def call_openrouter_api(model: str, base_resume: str, jd: str, role: str) -> str:
+    if not OPENROUTER_API_KEY:
+        st.error("No OpenRouter API key found. Add OPENROUTER_API_KEY in Streamlit Secrets.")
+        return base_resume
+    headers = {
+        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+        "Content-Type": "application/json",
+        "X-Title": "ATS Optimizer"
+    }
+    system_prompt = (
+        "You are an ATS resume optimizer. Preserve original section structure and bullet style. "
+        "Do not fabricate experience. Keep the tone concise and professional."
     )
-
-client = load_llm_client()
-
-# Clean text
-
-def clean_text(text):
-    text = re.sub(r'[^a-zA-Z0-9\s]', '', text.lower())
-    return re.sub(r'\s+', ' ', text).strip()
-
-# Extract resume content
-def extract_text_from_file(uploaded_file):
-    if uploaded_file.name.endswith(".pdf"):
-        pdf_reader = PdfReader(uploaded_file)
-        return "\n".join(page.extract_text() for page in pdf_reader.pages if page.extract_text())
-    elif uploaded_file.name.endswith(".docx"):
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".docx") as tmp:
-            tmp.write(uploaded_file.read())
-            return docx2txt.process(tmp.name)
+    user_prompt = (
+        f"TARGET ROLE: {role}\n\n"
+        f"JOB DESCRIPTION:\n{jd}\n\n"
+        f"CURRENT RESUME:\n{base_resume}\n\n"
+        "TASK: Rewrite the resume conservatively to maximize alignment with the JD. "
+        "Output ONLY the revised resume text."
+    )
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt}
+        ],
+        "temperature": 0.2
+    }
+    resp = requests.post(OPENROUTER_URL, headers=headers, json=payload, timeout=120)
+    if resp.status_code == 200:
+        return resp.json()["choices"][0]["message"]["content"]
     else:
-        return uploaded_file.read().decode("utf-8")
+        st.error(f"OpenRouter API error: {resp.text[:300]}")
+        return base_resume
 
-# Extract relevant keywords from text using SpaCy
-def extract_keywords(text):
-    doc = nlp(text)
-    return set([token.lemma_.lower() for token in doc if token.pos_ in ['NOUN', 'PROPN', 'VERB', 'ADJ'] and not token.is_stop])
+# ---------------------------
+# App
+# ---------------------------
+def main():
+    st.set_page_config(page_title="ATS Optimizer", page_icon="🧠", layout="wide")
+    st.title("🧠 ATS Resume Optimizer (Streamlit Cloud)")
 
-# LLM-enhanced score refinement and bullet suggestions
-def llm_adjust_score(score, resume_text, jd_text):
-    prompt = f"""
-    You're an advanced ATS evaluator. Analyze the resume and job description below.
-    Return:
-    - Revised score out of 100
-    - Two strengths
-    - Two weaknesses
-    - Three resume bullet improvements
+    with st.sidebar:
+        st.subheader("Model")
+        model = st.selectbox("Choose AI model", AVAILABLE_MODELS, index=0)
+        st.caption("Set your OPENROUTER_API_KEY in App → Settings → Secrets")
 
-    Resume: {resume_text[:1200]}
-    Job Description: {jd_text[:1200]}
+    uploaded_file = st.file_uploader("Upload your Resume (DOCX or PDF)", type=["docx", "pdf"])
+    jd_text = st.text_area("Paste the Job Description (JD)", height=220, placeholder="Paste full JD here…")
+    role_text = st.text_input("Target Role", placeholder="e.g., Data Analyst, QA Engineer")
 
-    Respond in JSON:
-    {{
-      "score": 78,
-      "strengths": [""],
-      "weaknesses": [""],
-      "suggestions": [""],
-    }}
-    """
-    try:
-        response = client.chat.completions.create(
-            model="deepseek/deepseek-r1-0528:free",
-            messages=[{"role": "user", "content": prompt}]
-        )
-        content = response.choices[0].message.content
-        parsed = json.loads(content)
-        return min(parsed.get("score", score), 100), parsed.get("strengths", []), parsed.get("weaknesses", []), parsed.get("suggestions", [])
-    except Exception:
-        return score, [], [], []
-
-# Calculate ATS score
-def calculate_ats_score(resume_text: str, job_description: str):
-    resume_clean = clean_text(resume_text)
-    jd_clean = clean_text(job_description)
-
-    tfidf = TfidfVectorizer(stop_words="english")
-    vectors = tfidf.fit_transform([jd_clean, resume_clean])
-    jd_vec, resume_vec = vectors[0], vectors[1]
-    keyword_similarity = cosine_similarity(jd_vec, resume_vec)[0][0]
-    score_keywords = round(keyword_similarity * 100, 2)
-
-    job_tokens = tfidf.get_feature_names_out()
-    resume_counts = resume_vec.toarray()[0]
-    matched = [token for token, count in zip(job_tokens, resume_counts) if count > 0]
-    missing = [token for token, count in zip(job_tokens, resume_counts) if count == 0]
-
-    emb_jd = model.encode(jd_clean, convert_to_tensor=True)
-    emb_resume = model.encode(resume_clean, convert_to_tensor=True)
-    semantic_score = util.cos_sim(emb_jd, emb_resume).item()
-    score_semantic = round(semantic_score * 100, 2)
-
-    # Adaptive weight logic
-    if len(jd_clean.split()) > 200:
-        final_score = round((score_keywords * 0.3 + score_semantic * 0.7), 2)
-    else:
-        final_score = round((score_keywords * 0.5 + score_semantic * 0.5), 2)
-
-    adjusted_score, strengths, weaknesses, bullet_suggestions = llm_adjust_score(final_score, resume_text, job_description)
-
-    tips = [f"Consider including the term '{word}' in your resume." for word in missing[:10]]
-
-    fit_status = "✅ Strong match!" if adjusted_score >= 75 else ("⚠️ Moderate match." if adjusted_score >= 50 else "❌ Low match.")
-
-    return adjusted_score, score_semantic, score_keywords, matched, missing, tips, fit_status, strengths, weaknesses, bullet_suggestions
-
-# Streamlit UI
-st.set_page_config(page_title="ATS Resume Scanner", layout="wide")
-st.title("📄 ATS Resume Scanner")
-
-col1, col2 = st.columns(2)
-with col1:
-    uploaded_resume = st.file_uploader("📁 Upload Resume (PDF, DOCX, TXT)", type=["pdf", "docx", "txt"])
     resume_text = ""
-    if uploaded_resume:
-        resume_text = extract_text_from_file(uploaded_resume)
-        st.success("Resume loaded successfully.")
-    else:
-        resume_text = st.text_area("Or paste your Resume Text", height=250)
+    if uploaded_file:
+        if uploaded_file.type == "application/pdf":
+            resume_text = read_pdf_text(uploaded_file)
+        else:
+            resume_text = read_docx_text(uploaded_file)
 
-with col2:
-    jd_input = st.text_area("📌 Paste Job Description", height=300)
+    if resume_text:
+        st.subheader("Original Resume Preview")
+        st.text_area("Original Resume", resume_text, height=250)
 
-if resume_text and jd_input:
-    with st.spinner("Analyzing your resume against the job description..."):
-        ats_score, semantic_score, keyword_score, matched, missing, tips, fit_status, strengths, weaknesses, suggestions = calculate_ats_score(resume_text, jd_input)
+    if st.button("Optimize Resume with AI") and resume_text and jd_text:
+        optimized_text = call_openrouter_api(model, resume_text, jd_text, role_text)
+        st.subheader("Optimized Resume (Editable)")
+        edited_text = st.text_area("Edit if needed", optimized_text, height=300, key="edit_box")
 
-    st.subheader("✅ ATS Match Results")
-    st.metric("Final ATS Score", f"{ats_score}%")
-    st.metric("Semantic Similarity", f"{semantic_score}%")
-    st.metric("Keyword Match Score", f"{keyword_score}%")
+        st.subheader("Difference (Unified Diff)")
+        st.code(make_unified_diff(resume_text, edited_text), language="diff")
 
-    st.markdown(f"### 💬 Fit Evaluation: {fit_status}")
+        # Downloads
+        txt_bytes = edited_text.encode("utf-8")
+        st.download_button("Download Optimized (TXT)", data=txt_bytes, file_name="optimized_resume.txt")
 
-    if strengths:
-        st.success("**Strengths:** " + ", ".join(strengths))
-    if weaknesses:
-        st.warning("**Weaknesses:** " + ", ".join(weaknesses))
+        docx_bytes = write_docx_from_text(edited_text)
+        if docx_bytes:
+            st.download_button("Download Optimized (DOCX)", data=docx_bytes,
+                               file_name="optimized_resume.docx",
+                               mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
 
-    if suggestions:
-        with st.expander("✍️ Suggested Resume Bullet Points"):
-            for i, tip in enumerate(suggestions, 1):
-                st.markdown(f"**{i}.** {tip}")
+    st.markdown("---")
+    st.caption("This build is Streamlit Cloud friendly (no local-only PDF export). Add ATS metrics later if desired.")
 
-    with st.expander("✅ Matching Keywords"):
-        st.write(", ".join(matched) if matched else "No keywords matched.")
-
-    with st.expander("❌ Missing Keywords"):
-        st.write(", ".join(missing) if missing else "All keywords matched!")
-
-    with st.expander("💡 Suggestions to Improve Match"):
-        st.write("\n".join(tips) if tips else "Your resume already covers most keywords!")
-else:
-    st.info("Please upload a resume and enter a job description to get started.")
+if __name__ == "__main__":
+    main()
