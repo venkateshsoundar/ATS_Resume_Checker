@@ -1,26 +1,21 @@
 
 import streamlit as st
 from docx import Document
-from docx.text.paragraph import Paragraph
 from io import BytesIO
-from rapidfuzz import fuzz, process
+from rapidfuzz import fuzz
 import re, datetime, os, httpx, yake
 
-st.set_page_config(page_title="ATS Resume Optimizer — Flexible", page_icon="🧩", layout="wide")
-st.title("ATS Resume Optimizer — Flexible (≤2 pages, 5–6 line Profile)")
+st.set_page_config(page_title="ATS Resume Optimizer — Two-Step", page_icon="🧰", layout="wide")
+st.title("ATS Resume Optimizer — Two-Step Workflow")
 
 st.markdown("""
-This version minimizes hardcoding:
-- **Headings** are *detected* from your document; you can **map** them in the UI.
-- **Keywords** come from the **Job Description** via **YAKE** (no hand-curated lists).
-- **Insertions** are *optional* and user-approved; no auto-fabrication.
-- **Profile** can be AI-polished via **OpenRouter** or rule-based without fixed sentences.
+**Flow**
+1) Upload **DOCX resume** and **paste the Job Description**  
+2) Click **Check ATS** → see **baseline ATS score + report**  
+3) Click **Optimize Resume** → see **optimized ATS score + report** and **download files**
 """)
 
-# -------------------------
-# Helpers
-# -------------------------
-
+# -------- Helpers --------
 def read_docx_text(doc: Document) -> str:
     parts = []
     for p in doc.paragraphs:
@@ -33,26 +28,19 @@ def read_docx_text(doc: Document) -> str:
     return "\n".join(parts)
 
 def detect_headings(doc: Document):
-    """
-    Heuristic heading detection: short lines, high uppercase ratio or Title-like,
-    not ending with a period.
-    """
     heads = []
     for i, p in enumerate(doc.paragraphs):
         t = (p.text or "").strip()
-        if not t: 
-            continue
+        if not t: continue
         if len(t) <= 60 and not t.endswith("."):
             uc_ratio = sum(1 for c in t if c.isupper()) / max(1, sum(1 for c in t if c.isalpha()))
             if uc_ratio > 0.5 or t.istitle() or t.isupper():
                 heads.append((i, t))
-    # dedupe by text
     seen = set(); out = []
     for i,t in heads:
         key = t.upper()
         if key not in seen:
-            seen.add(key)
-            out.append((i,t))
+            seen.add(key); out.append((i,t))
     return out
 
 def next_section_index(doc: Document, after_idx: int):
@@ -62,31 +50,25 @@ def next_section_index(doc: Document, after_idx: int):
             return i
     return len(doc.paragraphs)
 
-def delete_paragraph(paragraph: Paragraph):
+def delete_paragraph(paragraph):
     element = paragraph._element
     element.getparent().remove(element)
     paragraph._p = paragraph._element = None
 
 def insert_before_index(doc: Document, index: int, text: str):
-    """Insert a paragraph before 'index' safely."""
     if index < len(doc.paragraphs):
         doc.paragraphs[index].insert_paragraph_before(text)
     else:
         doc.add_paragraph(text)
 
-def extract_keywords_yake(jd_text: str, max_terms=40, lan="en"):
-    kw_extractor = yake.KeywordExtractor(lan=lan, n=1, dedupLim=0.9, top=max_terms//2)
-    kw_extractor2 = yake.KeywordExtractor(lan=lan, n=2, dedupLim=0.9, top=max_terms//2)
-    k1 = kw_extractor.extract_keywords(jd_text)
-    k2 = kw_extractor2.extract_keywords(jd_text)
-    cand = [w for w,_ in k1+k2]
-    # normalize and dedupe
+def extract_keywords_yake(jd_text: str, max_terms=44, lan="en"):
+    kw1 = yake.KeywordExtractor(lan=lan, n=1, dedupLim=0.9, top=max_terms//2).extract_keywords(jd_text)
+    kw2 = yake.KeywordExtractor(lan=lan, n=2, dedupLim=0.9, top=max_terms//2).extract_keywords(jd_text)
+    cand = [w for w,_ in kw1+kw2]
     seen = set(); out = []
     for w in cand:
-        w = w.strip().lower()
-        w = re.sub(r"\s+", " ", w)
-        if len(w) < 3: continue
-        if w not in seen:
+        w = re.sub(r"\s+", " ", w.strip().lower())
+        if len(w) >= 3 and w not in seen:
             seen.add(w); out.append(w)
     return out[:max_terms]
 
@@ -98,209 +80,200 @@ def score_text(text: str, keywords):
             matched.add(kw)
     return round(100*len(matched)/max(1,len(keywords)),2), matched
 
-def cap_bullets(doc: Document, section_idx: int, n_keep: int):
-    end = next_section_index(doc, section_idx)
-    kept = 0
-    i = section_idx+1
+def replace_profile(doc: Document, heading_guess: str, new_text: str):
+    det = detect_headings(doc)
+    # find best matching heading
+    choices = [t for _,t in det]
+    heading_guess_upper = heading_guess.upper()
+    h_idx = None
+    for i,t in det:
+        if t.upper() == heading_guess_upper:
+            h_idx = i; break
+    if h_idx is None and choices:
+        h_idx = det[0][0]  # fallback: first heading
+    if h_idx is None:
+        # no headings at all—prepend
+        if doc.paragraphs:
+            doc.paragraphs[0].insert_paragraph_before(new_text)
+            doc.paragraphs[0].insert_paragraph_before("PROFILE")
+        else:
+            doc.add_paragraph("PROFILE"); doc.add_paragraph(new_text)
+        return
+    end = next_section_index(doc, h_idx)
+    i = h_idx+1
+    while i < end:
+        delete_paragraph(doc.paragraphs[i]); end -= 1
+    insert_before_index(doc, end, new_text)
+
+def cap_bullets(doc: Document, section_heading: str, n_keep: int):
+    det = detect_headings(doc)
+    tgt = None
+    for i,t in det:
+        if t.upper() == section_heading.upper():
+            tgt = i; break
+    if tgt is None: return
+    end = next_section_index(doc, tgt)
+    kept = 0; i = tgt+1
     while i < end:
         p = doc.paragraphs[i]
         txt = (p.text or "").strip()
         if not txt:
             delete_paragraph(p); end -= 1; continue
-        # treat each non-empty line as a bullet for simplicity
         if kept < n_keep:
             kept += 1; i += 1
         else:
             delete_paragraph(p); end -= 1
 
-def replace_section_text(doc: Document, section_idx: int, new_text_lines):
-    """Replace entire section body with provided lines."""
-    end = next_section_index(doc, section_idx)
-    # delete existing body
-    i = section_idx+1
-    while i < end:
-        delete_paragraph(doc.paragraphs[i]); end -= 1
-    # insert new lines before next section
-    for line in reversed(new_text_lines):
-        insert_before_index(doc, end, line)
+def optimize_profile_from_jd(jd_keywords):
+    # 5–6 lines rule-based from JD terms
+    keybits = ", ".join(jd_keywords[:8])
+    lines = [
+        "QA professional experienced across desktop, web, and mobile applications.",
+        "Skilled in exploratory/manual testing, defect management, and release readiness.",
+        "Hands-on with SQL/logs for debugging and root-cause analysis in complex systems.",
+        "Collaborate with product, design, and engineering to build the right solutions.",
+        "Disciplined, analytical, and methodical; improve processes and QA outcomes.",
+        f"Familiar with: {keybits}"
+    ]
+    return " ".join(lines)
 
-def call_openrouter(messages, model, api_key, temperature=0.2, max_tokens=300, timeout=60):
-    if not api_key:
-        raise RuntimeError("Missing OPENROUTER_API_KEY")
-    url = "https://openrouter.ai/api/v1/chat/completions"
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "HTTP-Referer": "https://streamlit.io",
-        "X-Title": "ATS Resume Optimizer (Flexible)",
-        "Content-Type": "application/json",
-    }
-    payload = {"model": model, "messages": messages, "temperature": float(temperature), "max_tokens": int(max_tokens)}
-    with httpx.Client(timeout=timeout) as client:
-        r = client.post(url, headers=headers, json=payload)
-        r.raise_for_status()
-        return r.json()["choices"][0]["message"]["content"]
+def append_skills_keywords(doc: Document, skills_heading: str, kws_to_add):
+    det = detect_headings(doc)
+    tgt = None
+    for i,t in det:
+        if t.upper() == skills_heading.upper():
+            tgt = i; break
+    if tgt is None or not kws_to_add: return False
+    end = next_section_index(doc, tgt)
+    target = None
+    for j in range(tgt+1, end):
+        if (doc.paragraphs[j].text or "").strip():
+            target = j; break
+    if target is None:
+        target = end
+        insert_before_index(doc, end, "")
+    line = doc.paragraphs[target].text or ""
+    existing = set([x.strip().lower() for x in re.split(r"[;,/|]", line) if x.strip()])
+    add = [k for k in kws_to_add if k.lower() not in existing]
+    if not add: return False
+    combined = (line + (", " if line.strip() else "") + ", ".join(add)).strip()
+    doc.paragraphs[target].text = combined
+    return True
 
-# -------------------------
-# Inputs
-# -------------------------
-col1, col2 = st.columns([1,1])
-with col1:
+# -------- UI Inputs --------
+c1, c2 = st.columns([1,1])
+with c1:
     resume_file = st.file_uploader("Upload resume (.docx)", type=["docx"])
-with col2:
-    jd = st.text_area("Paste Job Description", height=260, placeholder="Paste the full JD text (no screenshots)")
+with c2:
+    jd = st.text_area("Paste Job Description", height=240, placeholder="Paste the full JD text here...")
 
 adv = st.expander("Advanced Options")
 with adv:
-    top_k = st.slider("Max JD keyphrases (YAKE)", 20, 80, 44, step=2)
-    bullets_keep = st.slider("Bullets per role (cap)", 2, 6, 4)
-    projects_keep = st.slider("Projects to keep", 2, 8, 4)
-    awards_keep = st.slider("Awards to keep", 0, 8, 4)
-    soft_char_cap = st.slider("Soft character cap (approx ≤2 pages)", 7000, 12000, 10000, step=500)
-    st.subheader("OpenRouter (Optional)")
-    use_llm = st.checkbox("Use OpenRouter to polish PROFILE (5–6 lines)")
-    model = st.selectbox("Model", ["openrouter/auto","openai/gpt-oss-20b:free","deepseek/deepseek-r1-0528:free"], index=0)
-    temp = st.slider("Temperature", 0.0, 1.0, 0.2, 0.1)
+    top_k = st.slider("JD keyphrases (YAKE)", 20, 80, 44, step=2)
+    heading_profile = st.text_input("Profile heading text in your doc", value="PROFILE")
+    heading_experience = st.text_input("Experience heading text in your doc", value="EMPLOYMENT EXPERIENCE")
+    heading_skills = st.text_input("Skills/Core Skills heading text in your doc", value="CORE SKILLS")
+    bullets_keep = st.slider("Bullets per role (cap during optimize)", 2, 6, 4)
+    add_missing_to_skills = st.checkbox("Add missing JD keywords into Skills (safe nouns only)")
+    safe_nouns_only = st.multiselect("Restrict additions to (edit as needed)", 
+        ["exploratory testing","functional testing","regression testing","integration testing","ui","ux",
+         "test plans","defect management","root-cause analysis","sql","logs","selenium","cypress","playwright",
+         "automation","manual testing","release readiness","pre-release testing"],
+        default=["exploratory testing","functional testing","regression testing","integration testing",
+                 "test plans","defect management","sql","logs","automation","manual testing","release readiness"]
+    )
 
-run = st.button("Optimize")
+st.divider()
 
-if run:
+# Step 1: Check ATS
+check = st.button("Check ATS")
+if check:
     if not resume_file or not jd.strip():
-        st.error("Please upload a DOCX resume and paste the JD.")
+        st.error("Please upload a DOCX resume and paste the Job Description.")
         st.stop()
-
-    doc = Document(resume_file)
-    baseline_text = read_docx_text(doc)
-    detected = detect_headings(doc)
-    if not detected:
-        st.error("Couldn't detect headings. Ensure your headings are short (e.g., PROFILE, EXPERIENCE, etc.).")
-        st.stop()
-
-    # Map headings without hardcoding
-    st.subheader("Map Headings")
-    options = [t for _,t in detected]
-    def suggest(name):
-        # fuzzy suggestion
-        if options:
-            best = process.extractOne(name, options)
-            return best[0] if best and best[1] >= 60 else options[0]
-        return None
-
-    h_profile = st.selectbox("Profile/Summary heading", options, index=options.index(suggest("PROFILE")) if suggest("PROFILE") in options else 0)
-    h_experience = st.selectbox("Experience heading", options, index=options.index(suggest("EXPERIENCE")) if suggest("EXPERIENCE") in options else 0)
-    h_projects = st.selectbox("Projects heading (optional)", ["— None —"]+options, index=0)
-    h_awards = st.selectbox("Awards/Accomplishments heading (optional)", ["— None —"]+options, index=0)
-    h_skills = st.selectbox("Skills/Core Skills heading (optional)", ["— None —"]+options, index=0)
-
-    # Extract JD keyphrases (no curated list)
+    src = Document(resume_file)
+    baseline_text = read_docx_text(src)
     jd_keywords = extract_keywords_yake(jd, max_terms=int(top_k))
     base_score, base_matched = score_text(baseline_text, jd_keywords)
 
-    st.write(f"**Baseline ATS:** {base_score}%")
-    st.caption("Note: keyword presence + fuzzy match (approximate)")
+    st.subheader("Baseline ATS")
+    st.metric("ATS Score", f"{base_score}%")
+    missing = [k for k in jd_keywords if k not in base_matched]
+    report = f"""# Baseline ATS Report
+Generated: {datetime.datetime.now():%Y-%m-%d %H:%M:%S}
 
-    # Build 5–6 line Profile (LLM or rules)
-    profile_idx = next(i for i,t in detected if t == h_profile)
-    prof_lines = []
-    if use_llm and "OPENROUTER_API_KEY" in st.secrets:
-        try:
-            system = "You are a resume optimizer. Write a 5–6 line profile for a QA/Testing professional using the job description. Keep factual, neutral, concise; avoid first person."
-            user = f"Job Description:\n{jd}\n\nWrite a 5–6 line profile summary. Plain text only."
-            resp = call_openrouter(
-                [{"role":"system","content":system},{"role":"user","content":user}],
-                model=model, api_key=st.secrets["OPENROUTER_API_KEY"], temperature=temp, max_tokens=220
-            )
-            # split into ~sentences
-            prof_lines = [ln.strip() for ln in re.split(r"[\\n\\.;]+", resp) if ln.strip()][:6]
-        except Exception as e:
-            st.warning(f"LLM failed, using rule-based summary. ({e})")
-    if not prof_lines:
-        # simple rule-based from JD keyphrases
-        keybits = ", ".join(jd_keywords[:8])
-        prof_lines = [
-            "QA professional with experience across complex applications and delivery environments.",
-            "Skilled in test design, defect management, data-driven debugging, and release readiness.",
-            "Hands-on across UI and business workflows; collaborate with engineering and product teams.",
-            "Analytical, methodical, and detail-oriented; improve quality through iterative feedback.",
-            "Comfortable managing pre-release testing and coordinating with cross-functional teams.",
-            f"Familiar with: {keybits}"
-        ]
-    # Replace section with new profile
-    replace_section_text(doc, profile_idx, [" ".join(prof_lines)])
+## JD Keyphrases ({len(jd_keywords)} via YAKE)
+{", ".join(jd_keywords)}
 
-    # Cap bullets in experience
-    exp_idx = next(i for i,t in detected if t == h_experience)
-    cap_bullets(doc, exp_idx, int(bullets_keep))
+## Matched ({len(base_matched)})
+{", ".join(sorted(base_matched))}
 
-    # Trim projects / awards if mapped
-    if h_projects != "— None —":
-        proj_idx = next(i for i,t in detected if t == h_projects)
-        cap_bullets(doc, proj_idx, int(projects_keep))
-    if h_awards != "— None —":
-        aw_idx = next(i for i,t in detected if t == h_awards)
-        cap_bullets(doc, aw_idx, int(awards_keep))
+## Missing
+{", ".join(missing) if missing else "—"}
+"""
+    st.download_button("⬇️ Download Baseline ATS Report (Markdown)", report.encode(), file_name="baseline_ATS_report.md")
+    with st.expander("Preview: first 2000 chars of resume text"):
+        st.write(baseline_text[:2000])
+
+st.divider()
+
+# Step 2: Optimize
+opt = st.button("Optimize Resume")
+if opt:
+    if not resume_file or not jd.strip():
+        st.error("Please upload a DOCX resume and paste the Job Description.")
+        st.stop()
+
+    doc = Document(resume_file)
+    jd_keywords = extract_keywords_yake(jd, max_terms=int(top_k))
+
+    # 1) Replace Profile
+    new_profile = optimize_profile_from_jd(jd_keywords)
+    replace_profile(doc, heading_profile, new_profile)
+
+    # 2) Cap bullets under Experience (keeps layout but shortens)
+    cap_bullets(doc, heading_experience, int(bullets_keep))
+
+    # 3) Optionally append missing nouns to Skills safely
+    if add_missing_to_skills:
+        # choose nouns that are in user-approved list
+        baseline_text = read_docx_text(doc)
+        _, matched_after_profile = score_text(baseline_text, jd_keywords)
+        missing_now = [k for k in jd_keywords if k not in matched_after_profile]
+        safe_add = [k for k in missing_now if k in [x.lower() for x in safe_nouns_only]]
+        appended = append_skills_keywords(doc, heading_skills, safe_add)
+        if appended:
+            st.info("Added selected missing JD nouns into Skills.")
 
     # Re-score
     final_text = read_docx_text(doc)
     final_score, final_matched = score_text(final_text, jd_keywords)
+    final_missing = [k for k in jd_keywords if k not in final_matched]
 
-    # Offer insertion suggestions into Skills (user approved)
-    if h_skills != "— None —":
-        st.subheader("Suggested JD terms to add to Skills (checkbox to include)")
-        missing = [k for k in jd_keywords if k not in final_matched]
-        colA, colB = st.columns(2)
-        chosen = []
-        for i,kw in enumerate(missing):
-            (colA if i%2==0 else colB).checkbox(kw, key=f"kw_{i}", value=False)
-        # gather
-        for i,kw in enumerate(missing):
-            if st.session_state.get(f"kw_{i}"):
-                chosen.append(kw)
+    # Downloads
+    out_buf = BytesIO(); doc.save(out_buf); out_buf.seek(0)
 
-        if st.button("Apply selected keywords to Skills"):
-            skills_idx = next(i for i,t in detected if t == h_skills)
-            end = next_section_index(doc, skills_idx)
-            # find or create first body line
-            target = None
-            for j in range(skills_idx+1, end):
-                if (doc.paragraphs[j].text or "").strip():
-                    target = j; break
-            if target is None:
-                target = end
-                insert_before_index(doc, end, "")
-            line = doc.paragraphs[target].text or ""
-            add = [w for w in chosen if w.lower() not in (line.lower())]
-            line = (line + (", " if line.strip() else "") + ", ".join(add)).strip()
-            doc.paragraphs[target].text = line
-            # refresh score
-            final_text = read_docx_text(doc)
-            final_score, final_matched = score_text(final_text, jd_keywords)
-            st.success("Skills updated.")
-
-    # Final length guard (soft)
-    if len(final_text) > int(soft_char_cap):
-        st.info("Document still appears long. Consider raising caps or removing older items.")
-    
-    # Output
-    out_buf = BytesIO()
-    doc.save(out_buf); out_buf.seek(0)
-    st.success("Done. Download below.")
-    st.download_button("⬇️ Download Optimized Resume (DOCX)", out_buf, file_name="optimized_resume.docx")
-
-    # Report
-    rep = f"""# ATS Report
+    st.subheader("Optimized Result")
+    st.metric("Optimized ATS Score", f"{final_score}%")
+    opt_report = f"""# Optimized ATS Report
 Generated: {datetime.datetime.now():%Y-%m-%d %H:%M:%S}
 
-## Summary
-- Baseline ATS: {base_score}%
-- Optimized ATS: {final_score}%
-
-## JD Keyphrases ({len(jd_keywords)} YAKE)
+## JD Keyphrases ({len(jd_keywords)} via YAKE)
 {", ".join(jd_keywords)}
 
 ## Matched after optimization ({len(final_matched)})
 {", ".join(sorted(final_matched))}
 
-## Suggestions
-Use the checkboxes above to add missing JD terms into Skills if accurate.
+## Still Missing
+{", ".join(final_missing) if final_missing else "—"}
+
+## Changes Applied
+- Rewrote PROFILE to 5–6-line condensed text derived from JD keyphrases
+- Capped bullets under Experience to {bullets_keep} per role
+- {'Added selected JD nouns into Skills' if add_missing_to_skills else 'No auto-insert into Skills'}
 """
-    st.download_button("⬇️ Download ATS Report (Markdown)", rep.encode(), file_name="ATS_report.md")
+    st.download_button("⬇️ Download Optimized Resume (DOCX)", out_buf, file_name="optimized_resume.docx")
+    st.download_button("⬇️ Download Optimized ATS Report (Markdown)", opt_report.encode(), file_name="optimized_ATS_report.md")
+
+    with st.expander("Preview: first 2000 chars (optimized text)"):
+        st.write(final_text[:2000])
